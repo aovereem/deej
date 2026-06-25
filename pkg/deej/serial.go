@@ -39,6 +39,11 @@ type SerialIO struct {
 	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
 
+	// negotiated via the optional boot handshake; these default to backwards-compatible
+	// values so firmware that never sends a handshake behaves exactly as before
+	adcMax            int // full-scale ADC reading used as the divisor (1023 for 10-bit AVR)
+	negotiatedSliders int // slider count declared by the device, or 0 if no handshake seen
+
 	sliderMoveConsumers []chan SliderMoveEvent
 }
 
@@ -48,7 +53,29 @@ type SliderMoveEvent struct {
 	PercentValue float32
 }
 
+// the default full-scale ADC value, assumed when the device sends no handshake (10-bit AVR)
+const defaultADCMax = 1023
+
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
+
+// optional boot handshake, e.g. "deej:hello:sliders=6:max=1023". the firmware sends this
+// periodically; it lets the host pin the slider count and ADC resolution instead of
+// inferring them from data frames. old firmware never sends it, and old hosts ignore it
+// (it doesn't match expectedLinePattern).
+var handshakePattern = regexp.MustCompile(`^deej:hello:sliders=(\d+):max=(\d+)\r?\n?$`)
+
+// parseHandshake returns the slider count and ADC full-scale value from a handshake line,
+// and ok=false if the line is not a handshake
+func parseHandshake(line string) (sliders int, adcMax int, ok bool) {
+	match := handshakePattern.FindStringSubmatch(line)
+	if match == nil {
+		return 0, 0, false
+	}
+
+	sliders, _ = strconv.Atoi(match[1])
+	adcMax, _ = strconv.Atoi(match[2])
+	return sliders, adcMax, true
+}
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with the arduino chip
@@ -61,6 +88,7 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 		stopChannel:         make(chan bool),
 		connected:           false,
 		conn:                nil,
+		adcMax:              defaultADCMax,
 		sliderMoveConsumers: []chan SliderMoveEvent{},
 	}
 
@@ -358,6 +386,23 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 
+	// an optional handshake line announces the device's slider count and ADC resolution.
+	// check it before the numeric data pattern; firmware without a handshake never sends it
+	if sliders, adcMax, ok := parseHandshake(line); ok {
+		if adcMax > 0 && adcMax != sio.adcMax {
+			logger.Infow("Device declared ADC resolution via handshake", "adcMax", adcMax)
+			sio.adcMax = adcMax
+		}
+		if sliders > 0 && sliders != sio.negotiatedSliders {
+			logger.Infow("Device declared slider count via handshake", "sliders", sliders)
+			sio.negotiatedSliders = sliders
+
+			// force the next data frame to re-emit move events for every slider
+			sio.lastKnownNumSliders = 0
+		}
+		return
+	}
+
 	// this function receives an unsanitized line which is guaranteed to end with LF,
 	// but most lines will end with CRLF. it may also have garbage instead of
 	// deej-formatted values, so we must check for that! just ignore bad ones
@@ -368,9 +413,17 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	// trim the suffix
 	line = strings.TrimSuffix(line, "\r\n")
 
-	// split on pipe (|), this gives a slice of numerical strings between "0" and "1023"
+	// split on pipe (|), this gives a slice of numerical strings between "0" and adcMax
 	splitLine := strings.Split(line, "|")
 	numSliders := len(splitLine)
+
+	// if the device declared its slider count via handshake, drop frames that don't match
+	// it (a torn/corrupt frame) instead of silently re-binding sliders to the wrong count
+	if sio.negotiatedSliders > 0 && numSliders != sio.negotiatedSliders {
+		sio.logger.Debugw("Ignoring serial frame with unexpected slider count",
+			"got", numSliders, "expected", sio.negotiatedSliders)
+		return
+	}
 
 	// update our slider count, if needed - this will send slider move events for all
 	if numSliders != sio.lastKnownNumSliders {
@@ -393,13 +446,13 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 
 		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
 		// so let's check the first number for correctness just in case
-		if sliderIdx == 0 && number > 1023 {
+		if sliderIdx == 0 && number > sio.adcMax {
 			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
 			return
 		}
 
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
-		dirtyFloat := float32(number) / 1023.0
+		dirtyFloat := float32(number) / float32(sio.adcMax)
 
 		// normalize it to an actual volume scalar between 0.0 and 1.0 with 2 points of precision
 		normalizedScalar := util.NormalizeScalar(dirtyFloat)
