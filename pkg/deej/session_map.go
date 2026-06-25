@@ -126,6 +126,7 @@ func (m *sessionMap) setupOnConfigReload() {
 	configReloadedChannel := m.deej.config.SubscribeToChanges()
 
 	go func() {
+		defer m.deej.recoverFromPanic()
 		for {
 			select {
 			case <-configReloadedChannel:
@@ -140,6 +141,7 @@ func (m *sessionMap) setupOnSliderMove() {
 	sliderEventsChannel := m.deej.serial.SubscribeToSliderMoveEvents()
 
 	go func() {
+		defer m.deej.recoverFromPanic()
 		for {
 			select {
 			case event := <-sliderEventsChannel:
