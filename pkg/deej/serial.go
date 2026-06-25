@@ -353,6 +353,15 @@ func (sio *SerialIO) close(logger *zap.SugaredLogger) {
 func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) chan string {
 	ch := make(chan string)
 
+	const (
+		// when a non-blocking serial read momentarily has no data, bufio reports
+		// io.ErrNoProgress; wait this long before retrying so we don't busy-spin the CPU
+		noDataReadDelay = 5 * time.Millisecond
+
+		// safety cap on a reassembled partial line, in case the stream never sends '\n'
+		maxPendingLineBytes = 1024
+	)
+
 	go func() {
 		defer sio.deej.recoverFromPanic()
 
@@ -360,23 +369,53 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 		// stream has ended (e.g. the device was unplugged), so it can reconnect
 		defer close(ch)
 
+		// bufio can return a partial line alongside io.ErrNoProgress when the non-blocking
+		// read momentarily runs dry mid-frame. accumulate those partials so we only ever
+		// deliver complete, newline-terminated lines - otherwise a frame split across two
+		// reads would be parsed as two short frames with the wrong slider count.
+		var pending strings.Builder
+
 		for {
-			line, err := reader.ReadString('\n')
+			chunk, err := reader.ReadString('\n')
 			if err != nil {
 
-				if sio.deej.Verbose() {
-					logger.Warnw("Failed to read line from serial", "error", err, "line", line)
+				// io.ErrNoProgress just means the non-blocking read had no data for a
+				// moment (the gap between frames, or the Arduino's post-open reset/boot
+				// window). that's transient, NOT a disconnect: buffer whatever partial we
+				// got and keep reading, instead of tearing down and reconnecting (which
+				// would re-assert DTR, reset the board, and loop forever).
+				if errors.Is(err, io.ErrNoProgress) {
+					pending.WriteString(chunk)
+					if pending.Len() > maxPendingLineBytes {
+						pending.Reset()
+					}
+
+					time.Sleep(noDataReadDelay)
+					continue
 				}
 
-				// stop reading; closing ch (deferred) tells the worker the stream ended
+				if sio.deej.Verbose() {
+					logger.Warnw("Failed to read line from serial", "error", err, "line", chunk)
+				}
+
+				// genuine read error (port closed / device unplugged); closing ch
+				// (deferred) tells the worker the stream ended so it can reconnect
 				return
+			}
+
+			// reassemble the full line from any buffered partial plus this final chunk
+			line := chunk
+			if pending.Len() > 0 {
+				pending.WriteString(chunk)
+				line = pending.String()
+				pending.Reset()
 			}
 
 			if sio.deej.Verbose() {
 				logger.Debugw("Read new line", "line", line)
 			}
 
-			// deliver the line to the channel
+			// deliver the complete line to the channel
 			ch <- line
 		}
 	}()
