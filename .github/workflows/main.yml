@@ -40,3 +40,16 @@ jobs:
       - name: Build deej (Linux)
         if: runner.os == 'Linux'
         run: pkg/deej/scripts/linux/build-${{ matrix.mode }}.sh
+
+      # publish each build as a downloadable artifact so binaries can be grabbed from
+      # any run without a local Go toolchain. Windows builds produce deej-<mode>.exe,
+      # Linux builds produce deej-<mode>; both land at the repo root.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deej-${{ matrix.os }}-${{ matrix.mode }}
+          path: |
+            deej-${{ matrix.mode }}.exe
+            deej-${{ matrix.mode }}
+          if-no-files-found: ignore
+          retention-days: 30
