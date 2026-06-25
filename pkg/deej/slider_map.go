@@ -20,21 +20,34 @@ func newSliderMap() *sliderMap {
 	}
 }
 
-func sliderMapFromConfigs(userMapping map[string][]string, internalMapping map[string][]string) *sliderMap {
+// sliderMapFromConfigs builds the slider map from the user and internal mappings. it also
+// returns the list of invalid (non-numeric or negative) slider indices found in the user
+// config so the caller can warn about them - previously these silently parsed to 0 and
+// clobbered slider 0's mapping.
+func sliderMapFromConfigs(userMapping map[string][]string, internalMapping map[string][]string) (*sliderMap, []string) {
 	resultMap := newSliderMap()
+	var invalidUserKeys []string
 
 	// copy targets from user config, ignoring empty values
 	for sliderIdxString, targets := range userMapping {
-		sliderIdx, _ := strconv.Atoi(sliderIdxString)
+		sliderIdx, err := strconv.Atoi(sliderIdxString)
+		if err != nil || sliderIdx < 0 {
+			invalidUserKeys = append(invalidUserKeys, sliderIdxString)
+			continue
+		}
 
 		resultMap.set(sliderIdx, funk.FilterString(targets, func(s string) bool {
 			return s != ""
 		}))
 	}
 
-	// add targets from internal configs, ignoring duplicate or empty values
+	// add targets from internal configs, ignoring duplicate or empty values.
+	// the internal config is machine-written, so invalid keys are skipped silently
 	for sliderIdxString, targets := range internalMapping {
-		sliderIdx, _ := strconv.Atoi(sliderIdxString)
+		sliderIdx, err := strconv.Atoi(sliderIdxString)
+		if err != nil || sliderIdx < 0 {
+			continue
+		}
 
 		existingTargets, ok := resultMap.get(sliderIdx)
 		if !ok {
@@ -49,7 +62,7 @@ func sliderMapFromConfigs(userMapping map[string][]string, internalMapping map[s
 		resultMap.set(sliderIdx, existingTargets)
 	}
 
-	return resultMap
+	return resultMap, invalidUserKeys
 }
 
 func (m *sliderMap) iterate(f func(int, []string)) {

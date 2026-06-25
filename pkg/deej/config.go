@@ -2,6 +2,7 @@ package deej
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/omriharel/deej/pkg/deej/util"
 )
@@ -54,9 +56,24 @@ const (
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
 
+	// accepted noise_reduction values (see util.SignificantlyDifferent)
+	noiseReductionLow     = "low"
+	noiseReductionDefault = "default"
+	noiseReductionHigh    = "high"
+
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 9600
 )
+
+// knownUserConfigKeys is the set of recognized top-level keys in config.yaml,
+// used to warn the user about typos and unknown settings
+var knownUserConfigKeys = map[string]bool{
+	configKeySliderMapping:       true,
+	configKeyInvertSliders:       true,
+	configKeyCOMPort:             true,
+	configKeyBaudRate:            true,
+	configKeyNoiseReductionLevel: true,
+}
 
 // has to be defined as a non-constant because we're using path.Join
 var internalConfigPath = path.Join(".", logDirectory)
@@ -89,6 +106,7 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyInvertSliders, false)
 	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
 	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
+	userConfig.SetDefault(configKeyNoiseReductionLevel, noiseReductionDefault)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -130,6 +148,10 @@ func (cc *CanonicalConfig) Load() error {
 
 		return fmt.Errorf("read user config: %w", err)
 	}
+
+	// viper silently keeps only the last of any duplicate key and ignores unknown keys,
+	// so re-inspect the raw file to warn the user about misconfiguration (non-fatal)
+	cc.validateUserConfigFile()
 
 	// load the internal config - this doesn't have to exist, so it can error
 	if err := cc.internalConfig.ReadInConfig(); err != nil {
@@ -215,13 +237,66 @@ func (cc *CanonicalConfig) StopWatchingConfigFile() {
 	cc.stopWatcherChannel <- true
 }
 
+// validateUserConfigFile re-parses the raw config file (viper collapses duplicate keys
+// and drops unknown ones silently) to surface misconfiguration to the user. it never fails
+// the load - the config is still usable - it just warns/notifies so problems aren't invisible.
+func (cc *CanonicalConfig) validateUserConfigFile() {
+	raw, err := os.ReadFile(userConfigFilepath)
+	if err != nil {
+		cc.logger.Debugw("Couldn't re-read config file for validation, skipping", "error", err)
+		return
+	}
+
+	// MapSlice preserves order and, crucially, duplicate top-level keys
+	var doc yaml.MapSlice
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		// viper already surfaced parse errors to the user; nothing more to do here
+		return
+	}
+
+	keyCounts := map[string]int{}
+	for _, item := range doc {
+		key, ok := item.Key.(string)
+		if !ok {
+			continue
+		}
+
+		keyCounts[key]++
+
+		if !knownUserConfigKeys[key] {
+			cc.logger.Warnw("Ignoring unknown config key (typo?)", "key", key)
+		}
+	}
+
+	for key, count := range keyCounts {
+		if count > 1 {
+			cc.logger.Warnw("Duplicate config key found, only the last occurrence takes effect",
+				"key", key, "occurrences", count)
+			cc.notifier.Notify("Duplicate setting in configuration!",
+				fmt.Sprintf("'%s' appears %d times in %s - only the last one is used. Please remove the duplicates.",
+					key, count, userConfigFilepath))
+		}
+	}
+}
+
 func (cc *CanonicalConfig) populateFromVipers() error {
 
 	// merge the slider mappings from the user and internal configs
-	cc.SliderMapping = sliderMapFromConfigs(
+	var invalidSliderKeys []string
+	cc.SliderMapping, invalidSliderKeys = sliderMapFromConfigs(
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
+
+	// a non-numeric or negative slider index used to silently fold into slider 0,
+	// clobbering its mapping - warn instead so the user can fix the typo
+	if len(invalidSliderKeys) > 0 {
+		cc.logger.Warnw("Ignoring slider mappings with invalid (non-numeric or negative) indices",
+			"keys", invalidSliderKeys)
+		cc.notifier.Notify("Invalid slider mapping!",
+			fmt.Sprintf("These slider numbers in %s aren't valid and were ignored: %s",
+				userConfigFilepath, strings.Join(invalidSliderKeys, ", ")))
+	}
 
 	// get the rest of the config fields - viper saves us a lot of effort here
 	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
@@ -237,7 +312,19 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	}
 
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
+
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	switch cc.NoiseReductionLevel {
+	case noiseReductionLow, noiseReductionDefault, noiseReductionHigh:
+		// recognized value, nothing to do
+	default:
+		cc.logger.Warnw("Invalid noise_reduction value, using default",
+			"key", configKeyNoiseReductionLevel,
+			"invalidValue", cc.NoiseReductionLevel,
+			"validValues", []string{noiseReductionLow, noiseReductionDefault, noiseReductionHigh})
+
+		cc.NoiseReductionLevel = noiseReductionDefault
+	}
 
 	cc.logger.Debug("Populated config fields from vipers")
 
