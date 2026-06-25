@@ -129,6 +129,7 @@ func (d *Deej) setupInterruptHandler() {
 	interruptChannel := util.SetupCloseHandler()
 
 	go func() {
+		defer d.recoverFromPanic()
 		signal := <-interruptChannel
 		d.logger.Debugw("Interrupted", "signal", signal)
 		d.signalStop()
@@ -136,13 +137,18 @@ func (d *Deej) setupInterruptHandler() {
 }
 
 func (d *Deej) run() {
+	defer d.recoverFromPanic()
 	d.logger.Info("Run loop starting")
 
 	// watch the config file for changes
-	go d.config.WatchConfigFileChanges()
+	go func() {
+		defer d.recoverFromPanic()
+		d.config.WatchConfigFileChanges()
+	}()
 
 	// connect to the arduino for the first time
 	go func() {
+		defer d.recoverFromPanic()
 		if err := d.serial.Start(); err != nil {
 			d.logger.Warnw("Failed to start first-time serial connection", "error", err)
 

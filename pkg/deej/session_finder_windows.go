@@ -3,6 +3,7 @@ package deej
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -57,18 +58,30 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 	sessions := []Session{}
 
+	// COM apartment state is per-OS-thread, but Go may migrate a goroutine across OS
+	// threads at almost any point. Without pinning, CoInitializeEx could run on one
+	// thread while a later COM call (e.g. mmDevice.Activate) runs on a different thread
+	// that was never initialized, producing the intermittent fatal
+	// "CoInitialize has not been called" crash. Pin this goroutine to its current OS
+	// thread for the entire COM critical section so init, all calls, and the deferred
+	// CoUninitialize below all execute on the same thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	// we must call this every time we're about to list devices, i think. could be wrong
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
 
 		// if the error is "Incorrect function" that corresponds to 0x00000001,
 		// which represents E_FALSE in COM error handling. this is fine for this function,
-		// and just means that the call was redundant.
+		// and just means that the call was redundant. it is an expected, benign result
+		// (not a real failure), so it's logged at debug to avoid spamming warnings on
+		// every session refresh.
 		const eFalse = 1
 		oleError := &ole.OleError{}
 
 		if errors.As(err, &oleError) {
 			if oleError.Code() == eFalse {
-				sf.logger.Warn("CoInitializeEx failed with E_FALSE due to redundant invocation")
+				sf.logger.Debug("CoInitializeEx returned E_FALSE (COM already initialized on this thread)")
 			} else {
 				sf.logger.Warnw("Failed to call CoInitializeEx",
 					"isOleError", true,

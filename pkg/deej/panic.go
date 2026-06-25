@@ -61,8 +61,10 @@ func (d *Deej) recoverFromPanic() {
 	d.notifier.Notify("Unexpected crash occurred...",
 		fmt.Sprintf("More details in %s", crashlogPath))
 
-	// bye :(
-	d.signalStop()
+	// bye :( - exit directly. we intentionally don't call signalStop() here: the
+	// graceful stop path can't run before os.Exit anyway, and signalStop performs a
+	// blocking channel send that would deadlock if this recover fires in the same
+	// goroutine that receives the stop signal.
 	d.logger.Errorw("Quitting", "exitCode", 1)
 	os.Exit(1)
 }

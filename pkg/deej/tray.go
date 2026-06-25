@@ -34,6 +34,7 @@ func (d *Deej) initializeTray(onDone func()) {
 
 		// wait on things to happen
 		go func() {
+			defer d.recoverFromPanic()
 			for {
 				select {
 
