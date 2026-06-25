@@ -11,23 +11,26 @@ jobs:
     name: Build
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # ubuntu-22.04 is pinned because getlantern/systray's cgo build hardcodes
+        # pkg-config webkit2gtk-4.0, which was dropped from ubuntu-24.04 (ubuntu-latest)
+        os: [windows-latest, ubuntu-22.04]
         mode: [release, dev]
-        go: ["1.14"]
+        go: ["1.23"]
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
 
       - name: Install prerequisites (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libwebkit2gtk-4.0-dev
-
-      - name: Checkout
-        uses: actions/checkout@v2
 
       - name: Build deej (Windows)
         if: runner.os == 'Windows'
